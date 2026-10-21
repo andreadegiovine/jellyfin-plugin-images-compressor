@@ -1,0 +1,20 @@
+---
+name: "Images compressor"
+guid: "599e8432-f99d-45ec-aa3a-412c19d47789"
+version: "0.1.0.0"
+targetAbi: "12.0.0.0"
+framework: "net10.0"
+overview: "Recompresses the images of the metadata folder and of the libraries to save disk space"
+description: >
+  Adds a scheduled task that recompresses the JPEG, PNG and WebP images found in the Jellyfin
+  metadata folder and in the library folders you choose, using the image encoder built into
+  Jellyfin (no external tools needed). The JPEG/WebP quality and the folders to process are set
+  from a page in the dashboard sidebar. Each processed file is marked, so it is never
+  compressed twice. The task is queued automatically after a library scan.
+category: "General"
+owner: "andreadegiovine"
+artifacts:
+- "Jellyfin.Plugin.ImagesCompressor.dll"
+changelog: >
+  0.1.0.0 - First version: configurable quality, per-folder enable/disable (metadata folder and
+  library folders), scheduled task queued after library scans.
