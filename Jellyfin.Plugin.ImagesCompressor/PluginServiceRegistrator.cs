@@ -18,6 +18,7 @@ public sealed class PluginServiceRegistrator : IPluginServiceRegistrator
     {
         serviceCollection.AddSingleton<CompressionMarkerStore>();
         serviceCollection.AddSingleton<ImageCompressor>();
+        serviceCollection.AddSingleton<RunHistoryStore>();
         serviceCollection.AddHostedService<LibraryScanQueueService>();
     }
 }

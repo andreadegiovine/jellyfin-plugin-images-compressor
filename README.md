@@ -49,6 +49,13 @@ Open **Dashboard → Images compressor** (it has its own entry in the dashboard 
 - It can also be started manually, or given its own triggers from the same page.
 - Only the ticked folders that still exist in Jellyfin are processed.
 
+## Run history
+
+The settings page ends with a **Run history** table with the details of the latest 50 runs (newest
+first): start and end time, total time, status, quality, analyzed paths, files to process, files
+processed, errors (expandable list), initial size, final size and space saved. Runs that find no
+new images are not recorded. The data is kept in `images-compressor/runs.json` in the Jellyfin data folder.
+
 ## How it works
 
 - Files with extension `jpg`, `jpeg`, `png` or `webp` are searched recursively (symbolic links are not followed).

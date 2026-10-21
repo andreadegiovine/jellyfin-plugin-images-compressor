@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Globalization;
 using System.IO;
 using System.Threading;
@@ -19,11 +20,13 @@ namespace Jellyfin.Plugin.ImagesCompressor.Services;
 public sealed class ImagesCompressorTask : IScheduledTask
 {
     private const int SaveEvery = 200;
+    private const int MaxRecordedErrors = 200;
 
     private readonly ILibraryManager _libraryManager;
     private readonly IServerApplicationPaths _applicationPaths;
     private readonly ImageCompressor _compressor;
     private readonly CompressionMarkerStore _markers;
+    private readonly RunHistoryStore _history;
     private readonly ILogger<ImagesCompressorTask> _logger;
 
     /// <summary>
@@ -33,18 +36,21 @@ public sealed class ImagesCompressorTask : IScheduledTask
     /// <param name="applicationPaths">Instance of the <see cref="IServerApplicationPaths"/> interface.</param>
     /// <param name="compressor">The image compressor.</param>
     /// <param name="markers">The store of already compressed files.</param>
+    /// <param name="history">The store of the run details.</param>
     /// <param name="logger">Instance of the <see cref="ILogger{ImagesCompressorTask}"/> interface.</param>
     public ImagesCompressorTask(
         ILibraryManager libraryManager,
         IServerApplicationPaths applicationPaths,
         ImageCompressor compressor,
         CompressionMarkerStore markers,
+        RunHistoryStore history,
         ILogger<ImagesCompressorTask> logger)
     {
         _libraryManager = libraryManager;
         _applicationPaths = applicationPaths;
         _compressor = compressor;
         _markers = markers;
+        _history = history;
         _logger = logger;
     }
 
@@ -180,12 +186,80 @@ public sealed class ImagesCompressorTask : IScheduledTask
                 quality,
                 roots.Count);
 
-            CompressFiles(pending, quality, progress, cancellationToken);
+            var startTime = DateTime.UtcNow;
+            var stopwatch = Stopwatch.StartNew();
+            var initialSize = SumSizes(pending);
+            var counters = new RunCounters();
+            var status = "Completed";
+
+            try
+            {
+                CompressFiles(pending, quality, counters, progress, cancellationToken);
+            }
+            catch (OperationCanceledException)
+            {
+                status = "Cancelled";
+                throw;
+            }
+            catch (Exception)
+            {
+                status = "Failed";
+                throw;
+            }
+            finally
+            {
+                stopwatch.Stop();
+                var run = new RunRecord
+                {
+                    StartTime = startTime,
+                    EndTime = DateTime.UtcNow,
+                    DurationSeconds = (long)stopwatch.Elapsed.TotalSeconds,
+                    Status = status,
+                    Paths = roots,
+                    Quality = quality,
+                    TotalFiles = pending.Count,
+                    ProcessedFiles = counters.Processed,
+                    ErrorCount = counters.ErrorCount,
+                    Errors = counters.Errors,
+                    InitialSize = initialSize,
+                    FinalSize = initialSize - counters.SavedBytes,
+                    SavedSize = counters.SavedBytes
+                };
+                _history.Add(run);
+
+                _logger.LogInformation(
+                    "{Prefix}{Status}: processed {Processed}/{Total} images, {Compressed} compressed, {Errors} errors, {Saved} saved",
+                    Plugin.LogPrefix,
+                    status,
+                    run.ProcessedFiles,
+                    run.TotalFiles,
+                    counters.Compressed,
+                    run.ErrorCount,
+                    FormatBytes(run.SavedSize));
+            }
         }
         finally
         {
             _markers.Save();
         }
+    }
+
+    private static long SumSizes(List<string> files)
+    {
+        long total = 0;
+        foreach (var file in files)
+        {
+            try
+            {
+                total += new FileInfo(file).Length;
+            }
+            catch (IOException)
+            {
+                // file removed in the meantime
+            }
+        }
+
+        return total;
     }
 
     private List<string> CollectPendingFiles(List<string> roots, CancellationToken cancellationToken)
@@ -221,62 +295,62 @@ public sealed class ImagesCompressorTask : IScheduledTask
         return pending;
     }
 
-    private void CompressFiles(List<string> files, int quality, IProgress<double> progress, CancellationToken cancellationToken)
+    private void CompressFiles(List<string> files, int quality, RunCounters counters, IProgress<double> progress, CancellationToken cancellationToken)
     {
-        var processed = 0;
-        var compressed = 0;
-        var errors = 0;
-        long savedBytes = 0;
         var lastPercent = -1;
 
-        try
+        foreach (var file in files)
         {
-            foreach (var file in files)
+            cancellationToken.ThrowIfCancellationRequested();
+
+            try
             {
-                cancellationToken.ThrowIfCancellationRequested();
-
-                try
+                var saved = _compressor.Compress(file, quality);
+                if (saved > 0)
                 {
-                    var saved = _compressor.Compress(file, quality);
-                    if (saved > 0)
-                    {
-                        compressed++;
-                        savedBytes += saved;
-                    }
-
-                    // Marked also when the result was not smaller, so the file is not retried at every run.
-                    _markers.Mark(file);
-                }
-                catch (Exception ex) when (ex is not OperationCanceledException)
-                {
-                    errors++;
-                    _logger.LogWarning(ex, "{Prefix}compression failed for {File}", Plugin.LogPrefix, file);
+                    counters.Compressed++;
+                    counters.SavedBytes += saved;
                 }
 
-                processed++;
-                var percent = (int)(processed * 100L / files.Count);
-                if (percent != lastPercent)
+                // Marked also when the result was not smaller, so the file is not retried at every run.
+                _markers.Mark(file);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                counters.ErrorCount++;
+                if (counters.Errors.Count < MaxRecordedErrors)
                 {
-                    lastPercent = percent;
-                    progress.Report(percent);
+                    counters.Errors.Add(file + ": " + ex.Message);
                 }
 
-                if (processed % SaveEvery == 0)
-                {
-                    _markers.Save();
-                }
+                _logger.LogWarning(ex, "{Prefix}compression failed for {File}", Plugin.LogPrefix, file);
+            }
+
+            counters.Processed++;
+            var percent = (int)(counters.Processed * 100L / files.Count);
+            if (percent != lastPercent)
+            {
+                lastPercent = percent;
+                progress.Report(percent);
+            }
+
+            if (counters.Processed % SaveEvery == 0)
+            {
+                _markers.Save();
             }
         }
-        finally
-        {
-            _logger.LogInformation(
-                "{Prefix}processed {Processed}/{Total} images, {Compressed} compressed, {Errors} errors, {Saved} saved",
-                Plugin.LogPrefix,
-                processed,
-                files.Count,
-                compressed,
-                errors,
-                FormatBytes(savedBytes));
-        }
+    }
+
+    private sealed class RunCounters
+    {
+        public int Processed { get; set; }
+
+        public int Compressed { get; set; }
+
+        public int ErrorCount { get; set; }
+
+        public long SavedBytes { get; set; }
+
+        public List<string> Errors { get; } = [];
     }
 }
